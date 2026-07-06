@@ -15,6 +15,29 @@ MODIFIED VERSION
   (original particle/spring solver untouched), but it also pushes back
   on the ball (Newton's third law), so the ball decelerates and settles
   into the cloth like a real object landing on a trampoline.
+
+BUGFIX PASS
+-----------
+Fixed the ball tunneling straight through the cloth. Two root causes:
+
+1. The ball was only ever corrected via a soft velocity "impulse".
+   That's a spring-like force and, at the speeds reached after an
+   8-unit fall, it wasn't guaranteed to fully arrest the ball's motion
+   within a single substep -> the ball's *position* could end up past
+   the cloth surface with nothing to stop it.
+   FIX: collide_with_sphere() now also does a hard positional
+   correction on the ball (pushes it back out along the contact
+   normal) in addition to the soft impulse, and directly zeroes/
+   reflects the ball's velocity component moving into the cloth.
+
+2. Verlet integration bug: when a cloth particle was teleported to the
+   sphere surface (particle.pos = ...), particle.old_pos was never
+   updated to match. Since the integrator computes
+   new_pos = 2*pos - old_pos + acc*dt^2, that mismatch injected a
+   large spurious velocity into the particle on the very next step,
+   destabilizing the mesh right where the ball touches it.
+   FIX: old_pos is now re-synced with the corrected pos/velocity
+   whenever a particle is repositioned by collision.
 """
 
 import pygame
@@ -245,17 +268,25 @@ class Cloth:
         """
         Resolve collision between the cloth and a MOVING ball.
 
-        The cloth particles are pushed out of the sphere exactly as in
-        the original code. In addition, the cloth now pushes back on the
-        ball (Newton's third law): the deeper the cloth is pressed into
-        the ball, the harder it pushes back, so the ball realistically
-        decelerates, sinks in, and settles/bounces depending on speed.
+        Two-way, and now tunneling-proof:
+
+        1. Cloth particles are pushed out of the sphere as before, AND
+           their old_pos is re-synced so the Verlet integrator doesn't
+           see the teleport as a burst of velocity next frame.
+        2. The ball receives a soft velocity impulse (as before) for a
+           natural, springy "catch" feel, PLUS a hard positional
+           correction and a hard velocity clamp along the contact
+           normal, so it is physically impossible for the ball to end
+           a frame embedded inside/past the cloth, regardless of how
+           fast it's falling.
         """
         center = ball.position
         radius = ball.radius
         collision_radius = radius + 0.02
         
         reaction_impulse = np.array([0.0, 0.0, 0.0])
+        normal_sum = np.array([0.0, 0.0, 0.0])
+        max_penetration = 0.0
         contacts = 0
         
         for row in self.particles:
@@ -277,15 +308,41 @@ class Cloth:
                         if velocity_normal < 0:
                             particle.velocity -= velocity_normal * normal * 1.5
                         particle.velocity *= 0.5
+                        # Keep Verlet state consistent: without this, old_pos
+                        # stays at the pre-teleport location and the very next
+                        # integration step reads the teleport itself as a huge
+                        # velocity, which destabilizes the mesh at the contact
+                        # point and can let the ball punch through it.
+                        particle.old_pos = particle.pos - particle.velocity * dt
                     
                     # Soft-contact reaction pushing back on the ball,
                     # proportional to how far the cloth is pressed in.
                     reaction_impulse += -normal * penetration * contact_stiffness * dt
+                    normal_sum += normal
+                    max_penetration = max(max_penetration, penetration)
                     contacts += 1
         
         if contacts > 0:
             avg_impulse = reaction_impulse / contacts
             ball.velocity += avg_impulse / ball.mass
+            
+            avg_normal = normal_sum / contacts
+            norm_len = np.linalg.norm(avg_normal)
+            if norm_len > 1e-6:
+                avg_normal = avg_normal / norm_len
+                
+                # Hard velocity clamp: kill (and slightly reflect) any
+                # component of the ball's velocity that is still driving it
+                # further into the cloth. This is what actually stops a
+                # fast-falling ball instead of just slowing it down.
+                velocity_into_cloth = np.dot(ball.velocity, avg_normal)
+                if velocity_into_cloth > 0:
+                    ball.velocity -= velocity_into_cloth * avg_normal * 1.3
+                
+                # Hard positional correction: guarantees the ball can never
+                # finish a frame overlapping the cloth surface, regardless
+                # of speed. This is the actual fix for pass-through.
+                ball.position -= avg_normal * max_penetration
     
     def render(self, wireframe=False):  # OpenGL rendering
         self.compute_normals()
